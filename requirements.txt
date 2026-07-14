@@ -1,0 +1,15 @@
+livekit-agents>=0.12
+livekit-plugins-deepgram
+livekit-plugins-cartesia
+livekit-plugins-groq
+livekit-plugins-silero
+livekit-plugins-turn-detector
+fastapi
+uvicorn
+websockets
+redis
+python-dotenv
+pydantic-settings
+python-json-logger
+pytest
+pytest-asyncio
