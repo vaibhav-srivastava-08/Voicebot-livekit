@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Voicebot Debug Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #8b8f9a;
+    --accent: #5b8cff;
+    --good: #3ecf8e;
+    --bad: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 24px;
+  }
+  main { width: 100%; max-width: 720px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+
+  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+
+  .status { font-size: 13px; color: var(--muted); }
+  .status.connected { color: var(--good); }
+  .status.error { color: var(--bad); }
+
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .card .value { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--border); flex-shrink: 0;
+  }
+  .dot.speaking { background: var(--good); box-shadow: 0 0 0 3px rgba(62, 207, 142, 0.25); }
+
+  .transcript {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    height: 360px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .line { font-size: 14px; line-height: 1.4; }
+  .line .who { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 2px; }
+  .line.you .who { color: var(--accent); }
+  .line.agent .who { color: var(--good); }
+  .empty { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voicebot Debug Console</h1>
+  <p class="sub">Joins a local LiveKit room, publishes your mic, and shows live agent state + transcript.</p>
+
+  <div class="controls">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+    <span id="status" class="status">idle</span>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">You</div>
+      <div class="value"><span id="youDot" class="dot"></span><span id="youState">-</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Agent</div>
+      <div class="value"><span id="agentDot" class="dot"></span><span id="agentState">-</span></div>
+    </div>
+  </div>
+
+  <div id="transcript" class="transcript">
+    <div class="empty">Transcript will appear here once connected.</div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script>
+  const { Room, RoomEvent, Track } = LivekitClient;
+
+  const connectBtn = document.getElementById("connectBtn");
+  const disconnectBtn = document.getElementById("disconnectBtn");
+  const statusEl = document.getElementById("status");
+  const transcriptEl = document.getElementById("transcript");
+  const youDot = document.getElementById("youDot");
+  const agentDot = document.getElementById("agentDot");
+  const agentStateEl = document.getElementById("agentState");
+  const youStateEl = document.getElementById("youState");
+
+  let room = null;
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = "status" + (kind ? " " + kind : "");
+  }
+
+  function addTranscriptLine(who, text) {
+    if (!text || !text.trim()) return;
+    const empty = transcriptEl.querySelector(".empty");
+    if (empty) empty.remove();
+    const line = document.createElement("div");
+    line.className = "line " + (who === "Agent" ? "agent" : "you");
+    line.innerHTML = '<div class="who">' + who + '</div><div>' + text.replace(/</g, "&lt;") + "</div>";
+    transcriptEl.appendChild(line);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  async function connect() {
+    connectBtn.disabled = true;
+    setStatus("requesting token…");
+
+    // A fresh room name per connection is required: LiveKit only dispatches a new agent job
+    // when a room is created. Reusing one fixed room name means later reconnects just rejoin
+    // the same still-alive (but now agent-less) room, and nothing ever responds.
+    const identity = "browser-user-" + Math.random().toString(36).slice(2, 8);
+    const roomName = "debug-room-" + Math.random().toString(36).slice(2, 8);
+    let tokenRes;
+    try {
+      tokenRes = await fetch("/token?room=" + roomName + "&identity=" + identity).then((r) => r.json());
+    } catch (err) {
+      setStatus("failed to reach bridge server for a token: " + err, "error");
+      connectBtn.disabled = false;
+      return;
+    }
+
+    room = new Room();
+
+    room.on(RoomEvent.Disconnected, () => {
+      setStatus("disconnected");
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      agentStateEl.textContent = "-";
+      agentDot.classList.remove("speaking");
+      youStateEl.textContent = "-";
+      youDot.classList.remove("speaking");
+    });
+
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind === Track.Kind.Audio) {
+        const el = track.attach();
+        el.autoplay = true;
+        document.body.appendChild(el);
+      }
+    });
+
+    room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      const identities = speakers.map((p) => p.identity);
+      youDot.classList.toggle("speaking", identities.includes(identity));
+      agentDot.classList.toggle("speaking", identities.some((id) => id !== identity));
+    });
+
+    room.on(RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
+      if (!participant.isLocal && changed["lk.agent.state"]) {
+        agentStateEl.textContent = changed["lk.agent.state"];
+      }
+    });
+
+    room.registerTextStreamHandler("lk.transcription", async (reader, participantInfo) => {
+      const text = await reader.readAll();
+      const isYou = participantInfo.identity === identity;
+      addTranscriptLine(isYou ? "You" : "Agent", text);
+    });
+
+    try {
+      await room.connect(tokenRes.url, tokenRes.token);
+      // Force echo cancellation/noise suppression/AGC on explicitly - without this, your own
+      // mic can pick up the agent's speaker output and you hear yourself (or garbled STT).
+      await room.localParticipant.setMicrophoneEnabled(true, {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      });
+    } catch (err) {
+      setStatus("connection failed: " + err, "error");
+      connectBtn.disabled = false;
+      return;
+    }
+
+    setStatus("connected — room \"" + tokenRes.room + "\" as " + identity, "connected");
+    youStateEl.textContent = "mic live";
+    agentStateEl.textContent = "waiting…";
+    disconnectBtn.disabled = false;
+  }
+
+  function disconnect() {
+    if (room) room.disconnect();
+  }
+
+  connectBtn.addEventListener("click", connect);
+  disconnectBtn.addEventListener("click", disconnect);
+</script>
+</body>
+</html>
