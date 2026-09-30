@@ -1,7 +1,10 @@
 livekit-agents>=0.12
 livekit-plugins-deepgram
+livekit-plugins-soniox
 livekit-plugins-cartesia
 livekit-plugins-groq
+livekit-plugins-google
+livekit-plugins-openai
 livekit-plugins-silero
 livekit-plugins-turn-detector
 fastapi
@@ -13,3 +16,7 @@ pydantic-settings
 python-json-logger
 pytest
 pytest-asyncio
+fakeredis
+beautifulsoup4
+rank-bm25
+fastembed

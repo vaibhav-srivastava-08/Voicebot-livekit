@@ -1,0 +1,66 @@
+# Production image for the LiveKit agent worker service. See DEPLOY.md for how to run N
+# replicas of this image against a shared LiveKit server + Redis.
+#
+# This is deliberately a separate file from Dockerfile.agent (used by docker-compose.yml for
+# local dev) rather than a modification of it, so the local dev flow is never at risk of being
+# broken by production hardening changes here. The two will drift in minor ways over time;
+# keep the shared baking steps (download-files, knowledge_base warmup) in sync by eye when one
+# changes, since there's no way to factor a common base without either losing the ability to
+# lint dev/prod images independently, or building both from a third intermediate image (not
+# worth the extra layer/maintenance for a two-Dockerfile project).
+
+FROM python:3.11-slim
+
+# PYTHONUNBUFFERED: log lines reach `docker logs`/your log collector immediately instead of
+# sitting in a stdio buffer - matters more here than in dev, where an attached terminal already
+# flushes on exit. PYTHONDONTWRITEBYTECODE: skip .pyc files - avoids a class of "stale bytecode
+# from a previous image layer" bugs and keeps the image a little smaller.
+#
+# HF_HOME: pins huggingface_hub's cache (used by the download-files baking step below) to a
+# fixed path under /app instead of its default of "whichever user's home directory is active"
+# ($HOME/.cache/huggingface). That default breaks the whole point of baking model weights in
+# below: the baking RUN steps execute as root (home /root), but the container later runs as
+# the unprivileged `agent` user (a different, empty home) - without this, the runtime user
+# would see an empty cache and try (and in a network-locked-down prod environment, fail) to
+# re-download the turn-detector model on every container start.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/app/.cache/huggingface
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY agent/ ./agent/
+COPY shared/ ./shared/
+COPY ["MSIL KNOWLEDGE BASE/", "./MSIL KNOWLEDGE BASE/"]
+
+# Bakes VAD/turn-detector model weights into the image so the container never needs to fetch
+# them from Hugging Face at runtime (matters more in prod: no outbound Hugging Face access
+# should be required for a replica to start serving traffic).
+RUN python -m livekit.agents download-files
+
+# Bakes the knowledge base's embedding model AND its precomputed chunk embeddings into the
+# image: importing agent.knowledge_base downloads the ONNX embedding model (~220MB, cached
+# under .fastembed_cache/models/) and computes+caches embeddings for every KB chunk
+# (.fastembed_cache/kb_chunk_embeddings.npz) - both then ship in the image, so no network call
+# and no ~1-2 minute recomputation happens at container startup or replica scale-up.
+RUN python -c "from agent import knowledge_base"
+
+# Run as a non-root, unprivileged user - standard hardening for anything running in a shared
+# production cluster. Ownership is set after all the baking steps above (which need to write
+# the fastembed cache under /app) so the runtime user only needs read access.
+RUN useradd --create-home --shell /usr/sbin/nologin agent \
+    && chown -R agent:agent /app
+USER agent
+
+# livekit-agents' own built-in HTTP server (started by the `start` subcommand, i.e. production
+# mode) listens on :8081 and serves GET / as a liveness/readiness check - see DEPLOY.md's
+# "Health/readiness expectations" section for the exact semantics. No curl in this slim image,
+# so the probe is a one-line urllib request instead of adding a package just for this.
+EXPOSE 8081
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python -c "import urllib.request as u; import sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8081/', timeout=3).status == 200 else 1)"
+
+CMD ["python", "-m", "agent.main", "start"]

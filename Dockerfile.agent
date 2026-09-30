@@ -9,5 +9,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent/ ./agent/
 COPY shared/ ./shared/
+COPY ["MSIL KNOWLEDGE BASE/", "./MSIL KNOWLEDGE BASE/"]
 
-CMD ["python", "-m", "agent.main"]
+# Bakes VAD/turn-detector model weights into the image so the container never needs to fetch
+# them from Hugging Face at runtime.
+RUN python -m livekit.agents download-files
+
+# Bakes the knowledge base's embedding model AND its precomputed chunk embeddings into the
+# image: importing agent.knowledge_base downloads the ONNX embedding model (~220MB, cached
+# under .fastembed_cache/models/) and computes+caches embeddings for every KB chunk
+# (.fastembed_cache/kb_chunk_embeddings.npz) - both then ship in the image, so no network call
+# and no ~1-2 minute recomputation happens at container startup.
+RUN python -c "from agent import knowledge_base"
+
+CMD ["python", "-m", "agent.main", "start"]

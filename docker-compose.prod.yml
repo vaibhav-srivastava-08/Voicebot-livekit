@@ -1,0 +1,80 @@
+# Production compose file: N agent replicas against a shared LiveKit server + Redis.
+#
+# This is a SEPARATE file from docker-compose.yml (the local dev flow, left unchanged) so
+# scaling this up can never affect `docker compose up` for local development. See DEPLOY.md for
+# the full guide: required env vars, what each scaling knob does, health/readiness expectations,
+# and how to load test.
+#
+# LiveKit itself is NOT run by this file - production deployments point LIVEKIT_URL (in .env) at
+# LiveKit Cloud or a separately-operated self-hosted LiveKit server/cluster, the same way
+# docker-compose.yml already treats LiveKit in local dev (it isn't started there either).
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up --build -d
+#   docker compose -f docker-compose.prod.yml up -d --scale agent=8   # override replica count
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent.prod
+    env_file:
+      - .env
+    environment:
+      # Production-appropriate scaling knobs - override per-deployment via the environment or
+      # .env. See DEPLOY.md's "Scaling knobs" section for what each one controls and how to
+      # size it for your traffic/CPU budget.
+      NUM_IDLE_PROCESSES: "${NUM_IDLE_PROCESSES:-2}"
+      WORKER_LOAD_THRESHOLD: "${WORKER_LOAD_THRESHOLD:-0.7}"
+      JOB_MEMORY_LIMIT_MB: "${JOB_MEMORY_LIMIT_MB:-0}"
+      DRAIN_TIMEOUT: "${DRAIN_TIMEOUT:-3600}"
+    volumes:
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+    # `deploy.replicas` is honored by `docker compose up` directly (no Swarm needed) as the
+    # default replica count; `--scale agent=N` on the command line overrides it for one run.
+    # Resource limits are a starting point, not a measured number - see DEPLOY.md's "Expected
+    # resource usage per worker" section for how to arrive at real values for your KB size and
+    # traffic before trusting these in production.
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          cpus: "0.5"
+          memory: 384M
+      restart_policy:
+        condition: on-failure
+
+  # The bridge currently doubles as this system's only working call-entry point (the
+  # Exotel-triggered dispatch described in agent/main.py's docstring isn't wired up yet - see
+  # bridge/dispatcher.py) and hosts the /token endpoint the browser debug page and
+  # scripts/loadtest.py both use to join a room and trigger agent dispatch.
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    env_file:
+      - .env
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # A single containerized Redis is enough to demonstrate/run shared call state across agent
+  # replicas, but has no HA story of its own (see DEPLOY.md). For a real production deployment,
+  # point REDIS_URL (in .env) at a managed Redis (e.g. ElastiCache, Redis Cloud, Memorystore)
+  # instead and drop this service.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

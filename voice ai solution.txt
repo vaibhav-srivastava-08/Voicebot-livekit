@@ -1,0 +1,58 @@
+# MSIL RFP 4.17 — Voice AI Driven Customer Interaction
+## Developer Solution Approach
+
+This is how we'd actually build the Voice AI part of the RFP (section 4.17). MSIL owns the Voice AI model (their vendor, their LLM); we own the orchestration layer around it — the control panel, the routing logic, and the API plumbing that hands calls off to their AI and brings the results back. We already have this exact shape built for our own ElevenLabs integration, so the approach is: treat MSIL's vendor as a second, swappable Voice AI backend behind the same abstraction, not a separate system.
+
+### Overall approach
+
+We keep a clean separation between two concerns, because they change independently:
+
+1. **Which AI is having the conversation** — the agent's script, voice, knowledge base, and which LLM it's running on. This is vendor-specific and configurable per agent.
+2. **How a call actually gets triggered and comes back to us** — the mechanics of placing an outbound call or reacting to an inbound one, and receiving the outcome.
+
+Everything we build for MSIL plugs into these two concerns as a new implementation, using the same interface our ElevenLabs integration already uses. Practically, that means writing one new "adapter" for MSIL's vendor — a small set of functions that speak MSIL's API — and reusing every layer above it (agent config storage, call records, lead updates, dashboards) untouched.
+
+### Building the control panel
+
+The control panel already exists as a generic layer that doesn't hardcode which AI vendor it's talking to — it just needs a vendor plugged in. The build here is:
+
+- A settings screen where someone enters MSIL's API URL and key once per organization, and a toggle for "use platform's default model" vs "use MSIL's model" — this is just a stored configuration record, not new logic.
+- The agent-builder screen (voice, script, qualification questions, objection handling, scheduling behaviour) stays exactly as-is; we only add MSIL as a selectable vendor option, and behind the scenes, saving an agent for MSIL calls MSIL's API instead of ElevenLabs' — same screen, different backend call.
+- Knowledge base upload stays the same UI; "sync" just gets a second implementation that pushes documents to MSIL's ingestion endpoint instead of ElevenLabs'.
+- The routing rules screen across two levels — Outlet and Virtual Number (no support for Zone, All-India, or Dealership level routing). A rule set per level, with an Outlet-level rule overriding a Virtual Number-level rule when both exist.
+- A screen for escalation conditions and an audit view (every config change and every qualification outcome, logged and searchable).
+
+### Building the API integration
+
+This is the real engineering work, handling outbound triggers, generic telephony provider inbound routing, and callback endpoints:
+
+**Outbound direction — we call MSIL.** Whenever the platform decides a call should happen (an outbound qualification call), we send MSIL's vendor a single request: who the customer is, their history, which agent/script to run, and a callback address to send results to later. This is a stateless "go do this" call — we don't hold the line open or manage the call ourselves.
+
+**Inbound call handling — generic telephony provider (e.g. TCL).** For incoming customer calls on a virtual number, we integrate with a generic telephony provider (such as TCL / Exotel). Upon receiving the inbound call event, we send them the designated Agent Number, Bot connection URL, or Bot ID to connect and place the live call directly to the AI agent.
+
+**Inbound callback — MSIL calls us back.** Once MSIL's vendor finishes a call, it hits our callback endpoint with the outcome: transcript, recording link, qualification result (qualified / not qualified / needs human review / follow-up), and a summary. We take that payload and update the lead record and call history automatically — no manual data entry. This webhook receiver verifies request signatures and is idempotent.
+
+**Knowledge base sync** is really just another outbound call — push whatever's uploaded in the control panel to MSIL's KB endpoint, get back a confirmation, show sync status.
+
+### Data model changes
+
+Almost nothing new needs to be stored — call records, lead records, and agent configuration all already have the right shape (transcript, summary, sentiment, outcome, recording link are all existing fields). The primary additions are:
+
+- A way to tell which vendor an agent/provider is connected to (right now it's implicit; it needs to be an explicit, readable field once there's more than one vendor).
+- Support for Outlet and Virtual Number level routing rules in the data model (removing all zonal and multi-tier regional routing complexity).
+
+Everything else — qualification outcome, transcripts, recordings — reuses existing fields; it's populated by MSIL's vendor instead of ElevenLabs.
+
+### Build order
+
+1. Get MSIL's actual API documentation and a sandbox to test against — nothing below can be finalized without it.
+2. Build the MSIL adapter: the outbound "trigger a call" call, generic telephony (TCL) inbound routing, and the inbound "receive result" webhook, tested against the sandbox with one simple flow first.
+3. Wire the adapter into the existing control panel as a second vendor option.
+4. Build the new routing screen (Outlet and Virtual Number rules) and connect it to how calls actually get routed.
+5. Add the escalation audit views once the basic call-and-report loop is working end to end.
+6. Expand to the other call types (inbound routing, lead qualification, objection handling flows) once the pilot flow is proven.
+
+### One open decision that affects the build
+
+MSIL's vendor might fully own the phone call itself (we just trigger it and get results back — the simpler case, and what the RFP's wording suggests), or it might expect us to carry the phone call and stream live audio to their AI in real time, the way we do technically for ElevenLabs today. The first case is a much smaller build (just the adapter above); the second means also building a live audio bridge, which is a bigger piece of work. This has to be confirmed with MSIL before Step 2 of the build order starts.
+ 
